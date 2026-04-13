@@ -2188,6 +2188,8 @@ function initApp(){
   const cachedChannels=CACHE.loadChannels();
   if(cachedChannels?.length>0){State.channels=cachedChannels;updateCatFilter();renderChannels()}
   loadChannels();loadNotificationsQuiet();
+  // Pre-cargar HLS.js en segundo plano para que esté listo al primer click
+  setTimeout(()=>loadHlsJs(()=>{}), 800);
   if(window._notifInterval)clearInterval(window._notifInterval);
   window._notifInterval=setInterval(loadNotificationsQuiet,90000);
   const manInput=$id('manualStreamUrl');if(manInput)manInput.addEventListener('keypress',e=>{if(e.key==='Enter')loadManualUrl()});
@@ -2486,9 +2488,9 @@ function updateCatFilter(){
 
 let _renderDebounceTimer = null;
 function renderChannels(){
-  // Debounce para evitar re-renders excesivos al escribir en el buscador
+  // Debounce mínimo — solo para evitar doble-render en cambios rápidos de filtro
   clearTimeout(_renderDebounceTimer);
-  _renderDebounceTimer = setTimeout(_doRenderChannels, 60);
+  _renderDebounceTimer = setTimeout(_doRenderChannels, 16);
 }
 function _doRenderChannels(){
   const grid=$id('channelsGrid');
@@ -2645,12 +2647,11 @@ const ChannelStatus = {
     const toCheck = channels.filter(ch => ch.url && ch.estado !== 'inactive');
     if (!toCheck.length) return;
 
-    // NO marcar todos como "verificando" de golpe — causa congelamiento visual
-    // Solo escanear bajo demanda en lotes pequeños con delay inicial
-    await new Promise(r => setTimeout(r, 1500)); // esperar que la UI esté lista
+    // Esperar que la UI esté completamente renderizada y estable
+    await new Promise(r => setTimeout(r, 3000));
 
-    // Solo escanear los primeros 12 canales visibles para no saturar
-    const limited = toCheck.slice(0, 12);
+    // Solo escanear los primeros 8 canales para no saturar la red
+    const limited = toCheck.slice(0, 8);
     for (let i = 0; i < limited.length; i += this.GRID_CONCURRENCY) {
       const batch = limited.slice(i, i + this.GRID_CONCURRENCY);
       await Promise.all(batch.map(async ch => {
@@ -2659,7 +2660,7 @@ const ChannelStatus = {
         this._updateCard(ch.id, state, label);
       }));
       if (i + this.GRID_CONCURRENCY < limited.length) {
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 800));
       }
     }
   }
@@ -2767,8 +2768,16 @@ function playChannel(ch){
   MediaSessionMgr.update(ch.nombre,ch.categoria,type,ch.imagen||null);
   SysNotif.show(ch.nombre,ch.categoria,type,ch.imagen||null);
   setPageTitle(ch,type);renderChannels();
-  // Scroll inmediato al reproductor
-  setTimeout(()=>document.querySelector('.player-wrap')?.scrollIntoView({behavior:'smooth',block:'nearest'}),50);
+  // Scroll inmediato al reproductor — subir al tope en móvil
+  setTimeout(()=>{
+    const pw=document.querySelector('.player-wrap');
+    if(!pw)return;
+    const rect=pw.getBoundingClientRect();
+    if(rect.top<0||rect.top>80){
+      const target=pw.getBoundingClientRect().top+window.scrollY-70;
+      window.scrollTo({top:Math.max(0,target),behavior:'smooth'});
+    }
+  },50);
 }
 
 /* ============================================================
@@ -2815,7 +2824,12 @@ function loadManualUrl(){
 
   NativeEngine.load(raw, type);
   setPageTitle(tempCh,type);renderChannels();
-  setTimeout(()=>document.querySelector('.player-wrap')?.scrollIntoView({behavior:'smooth',block:'nearest'}),50);
+  setTimeout(()=>{
+    const pw=document.querySelector('.player-wrap');
+    if(!pw)return;
+    const target=pw.getBoundingClientRect().top+window.scrollY-70;
+    window.scrollTo({top:Math.max(0,target),behavior:'smooth'});
+  },50);
 }
 
 /* ============================================================
@@ -5214,6 +5228,13 @@ function vpPlayUrl(url, ch) {
   vpStatus('Conectando…', 'loading');
   _vpLoadStream(url);
   vpRenderChannels();
+  // Scroll al reproductor VP
+  setTimeout(()=>{
+    const card=document.querySelector('.vp-player-card');
+    if(!card)return;
+    const target=card.getBoundingClientRect().top+window.scrollY-70;
+    window.scrollTo({top:Math.max(0,target),behavior:'smooth'});
+  },50);
 }
 
 function vpPlayChannel(ch) {
