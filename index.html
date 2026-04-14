@@ -1657,6 +1657,95 @@ const API = (() => {
 })();
 
 /* ============================================================
+   STREAM TOKEN — Protección de URLs de canales
+   ============================================================
+   El reproductor NUNCA usa ch.url directamente.
+   Pide al backend un token firmado → backend devuelve URL real.
+   Token TTL: 4h. Cache local: 3.5h para no re-pedir en cada play.
+   ============================================================ */
+const StreamToken = (() => {
+  'use strict';
+
+  // Caché local en memoria: { channelId: { token, url, tipo, exp } }
+  const _localCache = {};
+
+  // Limpiar entradas expiradas del caché local
+  function _prune() {
+    const now = Date.now();
+    Object.keys(_localCache).forEach(function(k) {
+      if (_localCache[k].exp && now > _localCache[k].exp - 60000) delete _localCache[k];
+    });
+  }
+
+  /**
+   * resolve(channelId, onSuccess, onFallback)
+   * Obtiene la URL real del canal via token firmado.
+   * onSuccess(url) => reproducir con esta URL
+   * onFallback()   => si hay error, el caller usa ch.url directamente
+   */
+  function resolve(channelId, onSuccess, onFallback) {
+    if (!channelId || channelId === '__manual__') {
+      if (onFallback) onFallback();
+      return;
+    }
+
+    const now = Date.now();
+    _prune();
+
+    // Servir desde caché local si el token aún tiene mas de 5 min de vida
+    const cached = _localCache[channelId];
+    if (cached && cached.url && cached.exp && now < cached.exp - 300000) {
+      onSuccess(cached.url);
+      return;
+    }
+
+    // Sin sesión activa → fallback inmediato
+    if (!State.token) {
+      if (onFallback) onFallback();
+      return;
+    }
+
+    // Pedir token al backend
+    API.get('getStreamToken', { channelId: channelId, token: State.token })
+      .then(function(res) {
+        if (res && res.success && res.data && res.data.token) {
+          return API.get('verifyStreamToken', {
+            tokenStream: res.data.token,
+            token: State.token
+          }).then(function(vres) {
+            if (vres && vres.valid && vres.url) {
+              _localCache[channelId] = {
+                url:  vres.url,
+                tipo: vres.tipo,
+                exp:  res.data.exp || (now + 3.5 * 60 * 60 * 1000)
+              };
+              onSuccess(vres.url);
+            } else {
+              console.warn('[StreamToken] verify fallo:', vres);
+              if (onFallback) onFallback();
+            }
+          });
+        } else {
+          console.warn('[StreamToken] getStreamToken fallo:', res);
+          if (onFallback) onFallback();
+        }
+      })
+      .catch(function(err) {
+        console.warn('[StreamToken] Error de red:', err);
+        if (onFallback) onFallback();
+      });
+  }
+
+  // Invalida cache de un canal (ej: al cambiar su URL desde admin)
+  function invalidate(channelId) {
+    if (channelId) delete _localCache[channelId];
+    else Object.keys(_localCache).forEach(function(k) { delete _localCache[k]; });
+  }
+
+  return { resolve, invalidate };
+})();
+
+/* ============================================================
    STATE
    ============================================================ */
 const State = {
@@ -2422,7 +2511,7 @@ function _normalizeStreamUrl(url) {
 /* ============================================================
    CHANNELS
    ============================================================ */
-function loadChannels(){
+function loadChannels(){StreamToken.invalidate();
   const grid=$id('channelsGrid');
   // Si no hay nada en pantalla, mostrar skeletons
   if(!State.channels.length){
@@ -2762,8 +2851,13 @@ function playChannel(ch){
 
   _showLoader(true,'Conectando…');
 
-  // Lanzar en el engine nativo
-  NativeEngine.load(ch.url, type);
+  // ── PROTECCIÓN TOKEN: Resolver URL real antes de reproducir ──
+  StreamToken.resolve(ch.id, function(resolvedUrl) {
+    NativeEngine.load(resolvedUrl, type);
+  }, function() {
+    // Fallback: si el token falla (ej: admin local), usar URL directa
+    NativeEngine.load(ch.url, type);
+  });
 
   MediaSessionMgr.update(ch.nombre,ch.categoria,type,ch.imagen||null);
   SysNotif.show(ch.nombre,ch.categoria,type,ch.imagen||null);
@@ -3939,7 +4033,7 @@ function renderAdminChannels(){
   clearBtn.addEventListener('click',()=>{_adminSearchQuery='';input.value='';clearBtn.classList.remove('visible');input.focus();_applyAdminSearch()});
 }
 
-function adminDeleteChannel(id){showConfirm('Eliminar canal','¿Seguro que deseas eliminar este canal?',()=>{API.post('deleteChannel',{channelId:id,token:State.token}).then(res=>{if(res.success){toast('Canal eliminado','success');loadAdminChannels();loadChannels()}else toast(res.error,'error')}).catch(()=>toast('Error al eliminar','error'))})}
+function adminDeleteChannel(id){showConfirm('Eliminar canal','¿Seguro que deseas eliminar este canal?',()=>{API.post('deleteChannel',{channelId:id,token:State.token}).then(res=>{if(res.success){StreamToken.invalidate(id);toast('Canal eliminado','success');loadAdminChannels();loadChannels()}else toast(res.error,'error')}).catch(()=>toast('Error al eliminar','error'))})}
 function switchM3UTab(tab){
   const isFile=tab==='file';
   $id('m3uTabFile').style.borderColor=isFile?'var(--accent)':'var(--border)';$id('m3uTabFile').style.color=isFile?'var(--accent2)':'var(--text2)';
@@ -5240,7 +5334,13 @@ function vpPlayUrl(url, ch) {
 function vpPlayChannel(ch) {
   if (!ch) return;
   if (ch.estado === 'inactive' && State.role !== 'ADMIN') { toast('Canal inactivo', 'error'); return; }
-  vpPlayUrl(ch.url, ch);
+  // ── PROTECCIÓN TOKEN: Resolver URL real antes de reproducir ──
+  StreamToken.resolve(ch.id, function(resolvedUrl) {
+    vpPlayUrl(resolvedUrl, ch);
+  }, function() {
+    // Fallback si el token falla
+    vpPlayUrl(ch.url, ch);
+  });
 }
 
 function vpLoadManual() {
