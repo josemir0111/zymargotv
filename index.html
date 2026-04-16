@@ -1664,17 +1664,16 @@ const API = (() => {
 /* ============================================================
    STREAM TOKEN — Protección de URLs de canales
    ============================================================
-   El reproductor NUNCA usa ch.url directamente.
-   Pide al backend un token firmado → backend devuelve URL real.
    Token TTL: 4h. Cache local: 3.5h para no re-pedir en cada play.
+   OPTIMIZACIÓN v2: 1 solo viaje al backend (url viene en getStreamToken).
+   prewarm() pre-carga tokens al renderizar la lista → click instantáneo.
    ============================================================ */
 const StreamToken = (() => {
   'use strict';
 
-  // Caché local en memoria: { channelId: { token, url, tipo, exp } }
+  // Caché local en memoria: { channelId: { url, tipo, exp } }
   const _localCache = {};
 
-  // Limpiar entradas expiradas del caché local
   function _prune() {
     const now = Date.now();
     Object.keys(_localCache).forEach(function(k) {
@@ -1684,9 +1683,8 @@ const StreamToken = (() => {
 
   /**
    * resolve(channelId, onSuccess, onFallback)
-   * Obtiene la URL real del canal via token firmado.
-   * onSuccess(url) => reproducir con esta URL
-   * onFallback()   => si hay error, el caller usa ch.url directamente
+   * OPTIMIZACIÓN v2: 1 solo viaje al backend — URL viene incluida en getStreamToken.
+   * Si la caché local tiene el token válido, reproducción 0ms de latencia.
    */
   function resolve(channelId, onSuccess, onFallback) {
     if (!channelId || channelId === '__manual__') {
@@ -1697,43 +1695,57 @@ const StreamToken = (() => {
     const now = Date.now();
     _prune();
 
-    // Servir desde caché local si el token aún tiene mas de 5 min de vida
+    // ── Caché local → reproducción INSTANTÁNEA ──
     const cached = _localCache[channelId];
     if (cached && cached.url && cached.exp && now < cached.exp - 300000) {
       onSuccess(cached.url);
       return;
     }
 
-    // Sin sesión activa → fallback inmediato
+    // Sin sesión activa → fallback inmediato (url del canal directamente)
     if (!State.token) {
       if (onFallback) onFallback();
       return;
     }
 
-    // Pedir token al backend
+    // ── Un solo viaje al backend ──
     API.get('getStreamToken', { channelId: channelId, token: State.token })
       .then(function(res) {
-        if (res && res.success && res.data && res.data.token) {
-          return API.get('verifyStreamToken', {
-            tokenStream: res.data.token,
-            token: State.token
-          }).then(function(vres) {
-            if (vres && vres.valid && vres.url) {
-              _localCache[channelId] = {
-                url:  vres.url,
-                tipo: vres.tipo,
-                exp:  res.data.exp || (now + 3.5 * 60 * 60 * 1000)
-              };
-              onSuccess(vres.url);
-            } else {
-              console.warn('[StreamToken] verify fallo:', vres);
-              if (onFallback) onFallback();
-            }
-          });
-        } else {
-          console.warn('[StreamToken] getStreamToken fallo:', res);
-          if (onFallback) onFallback();
+        if (res && res.success && res.data) {
+          const data = res.data;
+          // Backend v5.3+: url incluida directamente en la respuesta
+          if (data.url) {
+            _localCache[channelId] = {
+              url:  data.url,
+              tipo: data.tipo,
+              exp:  data.exp || (now + 3.5 * 60 * 60 * 1000)
+            };
+            onSuccess(data.url);
+            return;
+          }
+          // Compatibilidad con backend anterior (sin url en respuesta)
+          if (data.token) {
+            API.get('verifyStreamToken', {
+              tokenStream: data.token,
+              token: State.token
+            }).then(function(vres) {
+              if (vres && vres.valid && vres.url) {
+                _localCache[channelId] = {
+                  url:  vres.url,
+                  tipo: vres.tipo,
+                  exp:  data.exp || (now + 3.5 * 60 * 60 * 1000)
+                };
+                onSuccess(vres.url);
+              } else {
+                console.warn('[StreamToken] verify falló:', vres);
+                if (onFallback) onFallback();
+              }
+            }).catch(function() { if (onFallback) onFallback(); });
+            return;
+          }
         }
+        console.warn('[StreamToken] respuesta no válida:', res);
+        if (onFallback) onFallback();
       })
       .catch(function(err) {
         console.warn('[StreamToken] Error de red:', err);
@@ -1747,7 +1759,44 @@ const StreamToken = (() => {
     else Object.keys(_localCache).forEach(function(k) { delete _localCache[k]; });
   }
 
-  return { resolve, invalidate };
+  /**
+   * prewarm(channels) — Pre-calienta tokens en 2° plano.
+   * Llámalo tras renderizar la lista → tokens listos antes del primer click.
+   * Completamente silencioso, no bloquea la UI.
+   */
+  function prewarm(channels) {
+    if (!State.token || !channels || !channels.length) return;
+    const now = Date.now();
+    const toWarm = channels
+      .filter(function(ch) {
+        if (!ch.id || ch.estado === 'inactive') return false;
+        const c = _localCache[String(ch.id)];
+        return !c || !c.url || !c.exp || now >= c.exp - 300000;
+      })
+      .slice(0, 8); // máx 8 simultáneos
+
+    if (!toWarm.length) return;
+
+    // Escalonar 350ms entre requests para no saturar el proxy GAS
+    toWarm.forEach(function(ch, i) {
+      setTimeout(function() {
+        if (!State.token) return;
+        API.get('getStreamToken', { channelId: ch.id, token: State.token })
+          .then(function(res) {
+            if (res && res.success && res.data && res.data.url) {
+              _localCache[String(ch.id)] = {
+                url:  res.data.url,
+                tipo: res.data.tipo,
+                exp:  res.data.exp || (Date.now() + 3.5 * 60 * 60 * 1000)
+              };
+            }
+          })
+          .catch(function() {}); // silencioso
+      }, 1800 + i * 350); // esperar 1.8s tras el render antes de empezar
+    });
+  }
+
+  return { resolve, invalidate, prewarm };
 })();
 
 /* ============================================================
@@ -2282,8 +2331,8 @@ function initApp(){
   const cachedChannels=CACHE.loadChannels();
   if(cachedChannels?.length>0){State.channels=cachedChannels;updateCatFilter();renderChannels()}
   loadChannels();loadNotificationsQuiet();
-  // Pre-cargar HLS.js en segundo plano para que esté listo al primer click
-  setTimeout(()=>loadHlsJs(()=>{}), 800);
+  // Pre-cargar HLS.js INMEDIATAMENTE (sin delay) para que esté listo al primer click
+  loadHlsJs(()=>{});
   if(window._notifInterval)clearInterval(window._notifInterval);
   window._notifInterval=setInterval(loadNotificationsQuiet,90000);
   const manInput=$id('manualStreamUrl');if(manInput)manInput.addEventListener('keypress',e=>{if(e.key==='Enter')loadManualUrl()});
@@ -2624,6 +2673,8 @@ function _doRenderChannels(){
     frag.appendChild(card);
   });
   grid.innerHTML='';grid.appendChild(frag);
+  // Pre-calentar tokens de los canales visibles → click instantáneo
+  try { StreamToken.prewarm(filtered); } catch(e) {}
 }
 
 /* ============================================================
@@ -5505,6 +5556,8 @@ function vpRenderChannels() {
   });
   list.innerHTML = '';
   list.appendChild(frag);
+  // Pre-calentar tokens del VP también → click instantáneo
+  try { StreamToken.prewarm(filtered); } catch(e) {}
 }
 
 function vpOnEnter() {
