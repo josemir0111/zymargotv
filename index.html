@@ -1517,7 +1517,7 @@ const GAS_URL = (()=>{
    ============================================================ */
 const CACHE = {
   SETTINGS_KEY:'iptv_settings_v1', CHANNELS_KEY:'iptv_channels_v2',
-  CHANNELS_TTL:15*60*1000, SETTINGS_TTL:60*60*1000,
+  CHANNELS_TTL:30*60*1000, SETTINGS_TTL:60*60*1000,
   saveSettings(d){try{localStorage.setItem(this.SETTINGS_KEY,JSON.stringify({data:d,ts:Date.now()}))}catch(e){}},
   loadSettings(){try{const r=localStorage.getItem(this.SETTINGS_KEY);if(!r)return null;const{data,ts}=JSON.parse(r);if(Date.now()-ts>this.SETTINGS_TTL)return null;return data}catch(e){return null}},
   saveChannels(d){try{localStorage.setItem(this.CHANNELS_KEY,JSON.stringify({data:d,ts:Date.now()}))}catch(e){}},
@@ -1659,15 +1659,20 @@ const API = (() => {
 /* ============================================================
    STREAM TOKEN — Protección de URLs de canales
    ============================================================
-   El reproductor NUNCA usa ch.url directamente.
-   Pide al backend un token firmado → backend devuelve URL real.
-   Token TTL: 4h. Cache local: 3.5h para no re-pedir en cada play.
+   OPTIMIZACIÓN v2: Una sola petición al backend (getStreamToken).
+   El token firmado contiene la URL en base64 — se decodifica
+   localmente sin necesitar un segundo round-trip (verifyStreamToken).
+   Token TTL: 4h. Cache local: 3.5h para evitar re-peticiones.
+   Pre-warming: calienta tokens de los primeros canales visibles
+   en segundo plano para que el primer click sea instantáneo.
    ============================================================ */
 const StreamToken = (() => {
   'use strict';
 
-  // Caché local en memoria: { channelId: { token, url, tipo, exp } }
+  // Caché local en memoria: { channelId: { url, tipo, exp } }
   const _localCache = {};
+  // IDs en proceso de resolución (evita peticiones duplicadas)
+  const _inflight = {};
 
   // Limpiar entradas expiradas del caché local
   function _prune() {
@@ -1678,8 +1683,41 @@ const StreamToken = (() => {
   }
 
   /**
+   * _decodeToken(tokenStr) → payload | null
+   * Decodifica localmente el token firmado por el backend.
+   * El formato es: base64(JSON payload) + '.' + signature
+   * No verificamos la firma en el cliente (no tenemos el secret),
+   * pero sí verificamos la expiración y la estructura.
+   */
+  function _decodeToken(tokenStr) {
+    try {
+      if (!tokenStr || typeof tokenStr !== 'string') return null;
+      const dot = tokenStr.lastIndexOf('.');
+      if (dot < 0) return null;
+      const b64 = tokenStr.substring(0, dot);
+      // atob funciona en todos los navegadores modernos
+      // El backend usa Utilities.base64Encode(Utilities.newBlob(dataStr).getBytes())
+      // que es base64 estándar (no URL-safe) — atob lo maneja directamente
+      let dataStr;
+      try {
+        dataStr = atob(b64);
+      } catch(e) {
+        // Intentar base64url decode (reemplaza - y _ )
+        dataStr = atob(b64.replace(/-/g, '+').replace(/_/g, '/'));
+      }
+      const payload = JSON.parse(dataStr);
+      if (!payload || !payload.url || !payload.exp) return null;
+      if (Date.now() > payload.exp) return null; // expirado
+      return payload;
+    } catch(e) {
+      return null;
+    }
+  }
+
+  /**
    * resolve(channelId, onSuccess, onFallback)
    * Obtiene la URL real del canal via token firmado.
+   * OPTIMIZADO: una sola petición HTTP (getStreamToken).
    * onSuccess(url) => reproducir con esta URL
    * onFallback()   => si hay error, el caller usa ch.url directamente
    */
@@ -1692,7 +1730,7 @@ const StreamToken = (() => {
     const now = Date.now();
     _prune();
 
-    // Servir desde caché local si el token aún tiene mas de 5 min de vida
+    // FAST PATH: servir desde caché local si el token aún tiene mas de 5 min de vida
     const cached = _localCache[channelId];
     if (cached && cached.url && cached.exp && now < cached.exp - 300000) {
       onSuccess(cached.url);
@@ -1705,11 +1743,45 @@ const StreamToken = (() => {
       return;
     }
 
-    // Pedir token al backend
+    // Si ya hay una petición en vuelo para este canal, encolar el callback
+    if (_inflight[channelId]) {
+      _inflight[channelId].push({ onSuccess, onFallback });
+      return;
+    }
+    _inflight[channelId] = [{ onSuccess, onFallback }];
+
+    // UNA sola petición: getStreamToken devuelve el token con la URL embebida
     API.get('getStreamToken', { channelId: channelId, token: State.token })
       .then(function(res) {
+        const callbacks = _inflight[channelId] || [];
+        delete _inflight[channelId];
+
         if (res && res.success && res.data && res.data.token) {
-          return API.get('verifyStreamToken', {
+          // ULTRA-FAST PATH: el backend ya incluye url directamente en la respuesta
+          if (res.data.url) {
+            const entry = {
+              url:  res.data.url,
+              tipo: res.data.tipo || 'live',
+              exp:  res.data.exp  || (now + 3.5 * 60 * 60 * 1000)
+            };
+            _localCache[channelId] = entry;
+            callbacks.forEach(function(cb) { cb.onSuccess(entry.url); });
+            return;
+          }
+          // FAST PATH: decodificar token LOCALMENTE — sin segundo round-trip
+          const payload = _decodeToken(res.data.token);
+          if (payload && payload.url) {
+            const entry = {
+              url:  payload.url,
+              tipo: payload.tipo || 'live',
+              exp:  res.data.exp || (now + 3.5 * 60 * 60 * 1000)
+            };
+            _localCache[channelId] = entry;
+            callbacks.forEach(function(cb) { cb.onSuccess(entry.url); });
+            return;
+          }
+          // Si no se pudo decodificar localmente, hacer verify como fallback
+          API.get('verifyStreamToken', {
             tokenStream: res.data.token,
             token: State.token
           }).then(function(vres) {
@@ -1719,21 +1791,49 @@ const StreamToken = (() => {
                 tipo: vres.tipo,
                 exp:  res.data.exp || (now + 3.5 * 60 * 60 * 1000)
               };
-              onSuccess(vres.url);
+              callbacks.forEach(function(cb) { cb.onSuccess(vres.url); });
             } else {
               console.warn('[StreamToken] verify fallo:', vres);
-              if (onFallback) onFallback();
+              callbacks.forEach(function(cb) { if (cb.onFallback) cb.onFallback(); });
             }
+          }).catch(function() {
+            callbacks.forEach(function(cb) { if (cb.onFallback) cb.onFallback(); });
           });
         } else {
           console.warn('[StreamToken] getStreamToken fallo:', res);
-          if (onFallback) onFallback();
+          callbacks.forEach(function(cb) { if (cb.onFallback) cb.onFallback(); });
         }
       })
       .catch(function(err) {
+        const callbacks = _inflight[channelId] || [];
+        delete _inflight[channelId];
         console.warn('[StreamToken] Error de red:', err);
-        if (onFallback) onFallback();
+        callbacks.forEach(function(cb) { if (cb.onFallback) cb.onFallback(); });
       });
+  }
+
+  /**
+   * prewarm(channels, maxCount)
+   * Pre-calienta tokens de los primeros N canales en segundo plano.
+   * Así el primer click del usuario es instantáneo (sirve desde caché).
+   */
+  function prewarm(channels, maxCount) {
+    if (!State.token || !channels || !channels.length) return;
+    const toWarm = channels
+      .filter(function(ch) {
+        return ch.estado !== 'inactive' &&
+               ch.reproductor !== 'videoplayer' &&
+               !_localCache[ch.id];
+      })
+      .slice(0, maxCount || 5);
+
+    // Calentar con delay escalonado para no saturar la red
+    toWarm.forEach(function(ch, i) {
+      setTimeout(function() {
+        if (!State.token) return; // sesión cerrada
+        resolve(ch.id, function() {}, function() {});
+      }, 300 + i * 400); // 300ms, 700ms, 1100ms…
+    });
   }
 
   // Invalida cache de un canal (ej: al cambiar su URL desde admin)
@@ -1742,7 +1842,7 @@ const StreamToken = (() => {
     else Object.keys(_localCache).forEach(function(k) { delete _localCache[k]; });
   }
 
-  return { resolve, invalidate };
+  return { resolve, invalidate, prewarm };
 })();
 
 /* ============================================================
@@ -2277,8 +2377,8 @@ function initApp(){
   const cachedChannels=CACHE.loadChannels();
   if(cachedChannels?.length>0){State.channels=cachedChannels;updateCatFilter();renderChannels()}
   loadChannels();loadNotificationsQuiet();
-  // Pre-cargar HLS.js en segundo plano para que esté listo al primer click
-  setTimeout(()=>loadHlsJs(()=>{}), 800);
+  // Pre-cargar HLS.js INMEDIATAMENTE para que esté listo al primer click
+  loadHlsJs(()=>{});
   if(window._notifInterval)clearInterval(window._notifInterval);
   window._notifInterval=setInterval(loadNotificationsQuiet,90000);
   const manInput=$id('manualStreamUrl');if(manInput)manInput.addEventListener('keypress',e=>{if(e.key==='Enter')loadManualUrl()});
@@ -2525,6 +2625,8 @@ function loadChannels(){StreamToken.invalidate();
     CACHE.saveChannels(State.channels);
     updateCatFilter();
     renderChannels();
+    // Pre-calentar tokens de los primeros canales para click instantáneo
+    StreamToken.prewarm(State.channels, 6);
     // Scan de estado solo si la lista cambió (evitar re-scan innecesario)
     if(newJson!==oldJson) ChannelStatus.scanGrid(State.channels);
   }).catch(()=>{
@@ -2737,7 +2839,7 @@ const ChannelStatus = {
     if (!toCheck.length) return;
 
     // Esperar que la UI esté completamente renderizada y estable
-    await new Promise(r => setTimeout(r, 3000));
+    await new Promise(r => setTimeout(r, 1200));
 
     // Solo escanear los primeros 8 canales para no saturar la red
     const limited = toCheck.slice(0, 8);
