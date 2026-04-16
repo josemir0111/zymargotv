@@ -1618,7 +1618,8 @@ const API = (() => {
     const payload = JSON.stringify({ action, ...body });
     const base    = GAS_URL;
 
-    for (let i = 0; i < PROXIES.length - 1; i++) { // allorigins no soporta POST
+    // allorigins (último proxy) no soporta POST → iterar solo proxies que sí lo soporten
+    for (let i = 0; i < PROXIES.length - 1; i++) {
       const url = PROXIES[i](base);
       try {
         const res = await fetchWithTimeout(url, {
@@ -1637,9 +1638,13 @@ const API = (() => {
         return data;
       } catch (err) {
         console.warn(`[API] POST "${action}" proxy[${i}] falló:`, err.message);
+        // Si es el penúltimo proxy (el último disponible para POST), lanzar error
         if (i >= PROXIES.length - 2) throw err;
+        // Si no, continuar al siguiente proxy
       }
     }
+    // Si llegamos aquí sin retornar, lanzar error
+    throw new Error('Todos los proxies POST fallaron');
   }
 
   /* ── Ping de diagnóstico ── */
@@ -2589,7 +2594,9 @@ function _doRenderChannels(){
   const currentId=State.currentCh?String(State.currentCh.id):null;
   let filtered=State.channels.filter(ch=>{
     if(ch.estado==='inactive'&&State.role!=='ADMIN')return false;
-    if(ch.reproductor==='videoplayer')return false; // Ocultar si solo es para Video Player
+    // Ocultar en grilla nativa solo si está asignado EXCLUSIVAMENTE al Video Player
+    // Los admins siempre ven todos los canales aunque sean 'videoplayer'
+    if(ch.reproductor==='videoplayer'&&State.role!=='ADMIN')return false;
     if(search&&!ch.nombre.toLowerCase().includes(search)&&!(ch.categoria||'').toLowerCase().includes(search))return false;
     if(cat&&ch.categoria!==cat)return false;
     return true;
@@ -5458,7 +5465,9 @@ function vpRenderChannels() {
   const curUrl = VPState.currentUrl;
   const filtered = State.channels.filter(function(ch) {
     if (ch.estado === 'inactive' && State.role !== 'ADMIN') return false;
-    if (ch.reproductor === 'native') return false; // Ocultar si está asignado solo a nativo
+    // Ocultar en VP solo si está asignado EXCLUSIVAMENTE al reproductor nativo
+    // Los admins siempre ven todos los canales para poder probarlos
+    if (ch.reproductor === 'native' && State.role !== 'ADMIN') return false;
     if (search) {
       if (!(ch.nombre||'').toLowerCase().includes(search) &&
           !(ch.categoria||'').toLowerCase().includes(search)) return false;
@@ -5716,7 +5725,8 @@ const CoverAd = (function(){
   /* ── Reanudar reproductores después del anuncio ── */
   function _resumePlayers() {
     if (_pendingCb !== null) return; // hay canal nuevo — no interferir
-    if (!_wasPlaying || _wasPlaying === false) return;
+    // _wasPlaying es siempre un objeto {native, radio, vp} — nunca === false
+    if (!_wasPlaying || typeof _wasPlaying !== 'object') return;
     try {
       const nv = document.getElementById('videoPlayer');
       if (_wasPlaying.native && nv && nv.paused && nv.src) nv.play().catch(() => {});
@@ -6043,7 +6053,8 @@ const ViewStats = {
     if (!State || !State.token) return;
     try {
       const stats = await API.get('getViewStats', { token: State.token });
-      if (stats && typeof stats === 'object' && !stats.error && !stats.success === false) {
+      // FIX: aceptar el objeto de stats si no tiene propiedad 'error' ni es una respuesta _err()
+      if (stats && typeof stats === 'object' && !stats.error && stats.success !== false) {
         this._data  = stats;
         this._loaded = true;
         // Actualizar badges ya renderizados en las tarjetas
