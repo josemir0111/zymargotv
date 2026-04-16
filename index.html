@@ -1618,8 +1618,7 @@ const API = (() => {
     const payload = JSON.stringify({ action, ...body });
     const base    = GAS_URL;
 
-    // allorigins (último proxy) no soporta POST → iterar solo proxies que sí lo soporten
-    for (let i = 0; i < PROXIES.length - 1; i++) {
+    for (let i = 0; i < PROXIES.length - 1; i++) { // allorigins no soporta POST
       const url = PROXIES[i](base);
       try {
         const res = await fetchWithTimeout(url, {
@@ -1638,13 +1637,9 @@ const API = (() => {
         return data;
       } catch (err) {
         console.warn(`[API] POST "${action}" proxy[${i}] falló:`, err.message);
-        // Si es el penúltimo proxy (el último disponible para POST), lanzar error
         if (i >= PROXIES.length - 2) throw err;
-        // Si no, continuar al siguiente proxy
       }
     }
-    // Si llegamos aquí sin retornar, lanzar error
-    throw new Error('Todos los proxies POST fallaron');
   }
 
   /* ── Ping de diagnóstico ── */
@@ -1664,16 +1659,17 @@ const API = (() => {
 /* ============================================================
    STREAM TOKEN — Protección de URLs de canales
    ============================================================
+   El reproductor NUNCA usa ch.url directamente.
+   Pide al backend un token firmado → backend devuelve URL real.
    Token TTL: 4h. Cache local: 3.5h para no re-pedir en cada play.
-   OPTIMIZACIÓN v2: 1 solo viaje al backend (url viene en getStreamToken).
-   prewarm() pre-carga tokens al renderizar la lista → click instantáneo.
    ============================================================ */
 const StreamToken = (() => {
   'use strict';
 
-  // Caché local en memoria: { channelId: { url, tipo, exp } }
+  // Caché local en memoria: { channelId: { token, url, tipo, exp } }
   const _localCache = {};
 
+  // Limpiar entradas expiradas del caché local
   function _prune() {
     const now = Date.now();
     Object.keys(_localCache).forEach(function(k) {
@@ -1683,8 +1679,9 @@ const StreamToken = (() => {
 
   /**
    * resolve(channelId, onSuccess, onFallback)
-   * OPTIMIZACIÓN v2: 1 solo viaje al backend — URL viene incluida en getStreamToken.
-   * Si la caché local tiene el token válido, reproducción 0ms de latencia.
+   * Obtiene la URL real del canal via token firmado.
+   * onSuccess(url) => reproducir con esta URL
+   * onFallback()   => si hay error, el caller usa ch.url directamente
    */
   function resolve(channelId, onSuccess, onFallback) {
     if (!channelId || channelId === '__manual__') {
@@ -1695,57 +1692,43 @@ const StreamToken = (() => {
     const now = Date.now();
     _prune();
 
-    // ── Caché local → reproducción INSTANTÁNEA ──
+    // Servir desde caché local si el token aún tiene mas de 5 min de vida
     const cached = _localCache[channelId];
     if (cached && cached.url && cached.exp && now < cached.exp - 300000) {
       onSuccess(cached.url);
       return;
     }
 
-    // Sin sesión activa → fallback inmediato (url del canal directamente)
+    // Sin sesión activa → fallback inmediato
     if (!State.token) {
       if (onFallback) onFallback();
       return;
     }
 
-    // ── Un solo viaje al backend ──
+    // Pedir token al backend
     API.get('getStreamToken', { channelId: channelId, token: State.token })
       .then(function(res) {
-        if (res && res.success && res.data) {
-          const data = res.data;
-          // Backend v5.3+: url incluida directamente en la respuesta
-          if (data.url) {
-            _localCache[channelId] = {
-              url:  data.url,
-              tipo: data.tipo,
-              exp:  data.exp || (now + 3.5 * 60 * 60 * 1000)
-            };
-            onSuccess(data.url);
-            return;
-          }
-          // Compatibilidad con backend anterior (sin url en respuesta)
-          if (data.token) {
-            API.get('verifyStreamToken', {
-              tokenStream: data.token,
-              token: State.token
-            }).then(function(vres) {
-              if (vres && vres.valid && vres.url) {
-                _localCache[channelId] = {
-                  url:  vres.url,
-                  tipo: vres.tipo,
-                  exp:  data.exp || (now + 3.5 * 60 * 60 * 1000)
-                };
-                onSuccess(vres.url);
-              } else {
-                console.warn('[StreamToken] verify falló:', vres);
-                if (onFallback) onFallback();
-              }
-            }).catch(function() { if (onFallback) onFallback(); });
-            return;
-          }
+        if (res && res.success && res.data && res.data.token) {
+          return API.get('verifyStreamToken', {
+            tokenStream: res.data.token,
+            token: State.token
+          }).then(function(vres) {
+            if (vres && vres.valid && vres.url) {
+              _localCache[channelId] = {
+                url:  vres.url,
+                tipo: vres.tipo,
+                exp:  res.data.exp || (now + 3.5 * 60 * 60 * 1000)
+              };
+              onSuccess(vres.url);
+            } else {
+              console.warn('[StreamToken] verify fallo:', vres);
+              if (onFallback) onFallback();
+            }
+          });
+        } else {
+          console.warn('[StreamToken] getStreamToken fallo:', res);
+          if (onFallback) onFallback();
         }
-        console.warn('[StreamToken] respuesta no válida:', res);
-        if (onFallback) onFallback();
       })
       .catch(function(err) {
         console.warn('[StreamToken] Error de red:', err);
@@ -1759,44 +1742,7 @@ const StreamToken = (() => {
     else Object.keys(_localCache).forEach(function(k) { delete _localCache[k]; });
   }
 
-  /**
-   * prewarm(channels) — Pre-calienta tokens en 2° plano.
-   * Llámalo tras renderizar la lista → tokens listos antes del primer click.
-   * Completamente silencioso, no bloquea la UI.
-   */
-  function prewarm(channels) {
-    if (!State.token || !channels || !channels.length) return;
-    const now = Date.now();
-    const toWarm = channels
-      .filter(function(ch) {
-        if (!ch.id || ch.estado === 'inactive') return false;
-        const c = _localCache[String(ch.id)];
-        return !c || !c.url || !c.exp || now >= c.exp - 300000;
-      })
-      .slice(0, 8); // máx 8 simultáneos
-
-    if (!toWarm.length) return;
-
-    // Escalonar 350ms entre requests para no saturar el proxy GAS
-    toWarm.forEach(function(ch, i) {
-      setTimeout(function() {
-        if (!State.token) return;
-        API.get('getStreamToken', { channelId: ch.id, token: State.token })
-          .then(function(res) {
-            if (res && res.success && res.data && res.data.url) {
-              _localCache[String(ch.id)] = {
-                url:  res.data.url,
-                tipo: res.data.tipo,
-                exp:  res.data.exp || (Date.now() + 3.5 * 60 * 60 * 1000)
-              };
-            }
-          })
-          .catch(function() {}); // silencioso
-      }, 1800 + i * 350); // esperar 1.8s tras el render antes de empezar
-    });
-  }
-
-  return { resolve, invalidate, prewarm };
+  return { resolve, invalidate };
 })();
 
 /* ============================================================
@@ -2331,8 +2277,8 @@ function initApp(){
   const cachedChannels=CACHE.loadChannels();
   if(cachedChannels?.length>0){State.channels=cachedChannels;updateCatFilter();renderChannels()}
   loadChannels();loadNotificationsQuiet();
-  // Pre-cargar HLS.js INMEDIATAMENTE (sin delay) para que esté listo al primer click
-  loadHlsJs(()=>{});
+  // Pre-cargar HLS.js en segundo plano para que esté listo al primer click
+  setTimeout(()=>loadHlsJs(()=>{}), 800);
   if(window._notifInterval)clearInterval(window._notifInterval);
   window._notifInterval=setInterval(loadNotificationsQuiet,90000);
   const manInput=$id('manualStreamUrl');if(manInput)manInput.addEventListener('keypress',e=>{if(e.key==='Enter')loadManualUrl()});
@@ -2643,10 +2589,7 @@ function _doRenderChannels(){
   const currentId=State.currentCh?String(State.currentCh.id):null;
   let filtered=State.channels.filter(ch=>{
     if(ch.estado==='inactive'&&State.role!=='ADMIN')return false;
-    // Grilla NATIVA: mostrar canales asignados a 'native' o 'ambos'
-    // Los de 'videoplayer' solo se ven si el admin necesita gestionarlos
-    const rep = ch.reproductor || 'native';
-    if(rep === 'videoplayer' && State.role !== 'ADMIN') return false;
+    if(ch.reproductor==='videoplayer')return false; // Ocultar si solo es para Video Player
     if(search&&!ch.nombre.toLowerCase().includes(search)&&!(ch.categoria||'').toLowerCase().includes(search))return false;
     if(cat&&ch.categoria!==cat)return false;
     return true;
@@ -2674,8 +2617,6 @@ function _doRenderChannels(){
     frag.appendChild(card);
   });
   grid.innerHTML='';grid.appendChild(frag);
-  // Pre-calentar tokens de los canales visibles → click instantáneo
-  try { StreamToken.prewarm(filtered); } catch(e) {}
 }
 
 /* ============================================================
@@ -2853,24 +2794,13 @@ function _applyLiveMode(isLive){
 function playChannelById(id){
   const ch=State.channels.find(c=>String(c.id)===String(id));
   if(!ch){toast('Canal no encontrado','error');return}
-  const rep = ch.reproductor || 'native';
   /* ── Enrutamiento por reproductor asignado ── */
-  if(rep === 'videoplayer'){
-    // Solo Video Player: cambiar vista y reproducir allí
+  if(ch.reproductor==='videoplayer'){
+    // Cambiar a la sección Video Player y reproducir allí
     showView('videoPlayer');
     setTimeout(()=>vpPlayChannel(ch), 80);
     return;
   }
-  if(rep === 'ambos'){
-    // Ambos: reproducir en el reproductor actualmente visible
-    const vpView = document.getElementById('viewVideoPlayer');
-    if(vpView && vpView.classList.contains('active')){
-      vpPlayChannel(ch);
-      return;
-    }
-    // Si no está en VP, usar reproductor nativo
-  }
-  // 'native' o default: reproductor nativo
   playChannel(ch);
 }
 
@@ -5528,10 +5458,7 @@ function vpRenderChannels() {
   const curUrl = VPState.currentUrl;
   const filtered = State.channels.filter(function(ch) {
     if (ch.estado === 'inactive' && State.role !== 'ADMIN') return false;
-    const rep = ch.reproductor || 'native';
-    // VP: mostrar canales asignados a 'videoplayer' o 'ambos'
-    // Los de 'native' puro no aparecen en el VP (salvo al admin para que pueda gestionarlos)
-    if (rep === 'native' && State.role !== 'ADMIN') return false;
+    if (ch.reproductor === 'native') return false; // Ocultar si está asignado solo a nativo
     if (search) {
       if (!(ch.nombre||'').toLowerCase().includes(search) &&
           !(ch.categoria||'').toLowerCase().includes(search)) return false;
@@ -5569,8 +5496,6 @@ function vpRenderChannels() {
   });
   list.innerHTML = '';
   list.appendChild(frag);
-  // Pre-calentar tokens del VP también → click instantáneo
-  try { StreamToken.prewarm(filtered); } catch(e) {}
 }
 
 function vpOnEnter() {
@@ -5791,8 +5716,7 @@ const CoverAd = (function(){
   /* ── Reanudar reproductores después del anuncio ── */
   function _resumePlayers() {
     if (_pendingCb !== null) return; // hay canal nuevo — no interferir
-    // _wasPlaying es siempre un objeto {native, radio, vp} — nunca === false
-    if (!_wasPlaying || typeof _wasPlaying !== 'object') return;
+    if (!_wasPlaying || _wasPlaying === false) return;
     try {
       const nv = document.getElementById('videoPlayer');
       if (_wasPlaying.native && nv && nv.paused && nv.src) nv.play().catch(() => {});
@@ -6119,8 +6043,7 @@ const ViewStats = {
     if (!State || !State.token) return;
     try {
       const stats = await API.get('getViewStats', { token: State.token });
-      // FIX: aceptar el objeto de stats si no tiene propiedad 'error' ni es una respuesta _err()
-      if (stats && typeof stats === 'object' && !stats.error && stats.success !== false) {
+      if (stats && typeof stats === 'object' && !stats.error && !stats.success === false) {
         this._data  = stats;
         this._loaded = true;
         // Actualizar badges ya renderizados en las tarjetas
