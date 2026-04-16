@@ -2643,9 +2643,10 @@ function _doRenderChannels(){
   const currentId=State.currentCh?String(State.currentCh.id):null;
   let filtered=State.channels.filter(ch=>{
     if(ch.estado==='inactive'&&State.role!=='ADMIN')return false;
-    // Ocultar en grilla nativa solo si está asignado EXCLUSIVAMENTE al Video Player
-    // Los admins siempre ven todos los canales aunque sean 'videoplayer'
-    if(ch.reproductor==='videoplayer'&&State.role!=='ADMIN')return false;
+    // Grilla NATIVA: mostrar canales asignados a 'native' o 'ambos'
+    // Los de 'videoplayer' solo se ven si el admin necesita gestionarlos
+    const rep = ch.reproductor || 'native';
+    if(rep === 'videoplayer' && State.role !== 'ADMIN') return false;
     if(search&&!ch.nombre.toLowerCase().includes(search)&&!(ch.categoria||'').toLowerCase().includes(search))return false;
     if(cat&&ch.categoria!==cat)return false;
     return true;
@@ -2852,13 +2853,24 @@ function _applyLiveMode(isLive){
 function playChannelById(id){
   const ch=State.channels.find(c=>String(c.id)===String(id));
   if(!ch){toast('Canal no encontrado','error');return}
+  const rep = ch.reproductor || 'native';
   /* ── Enrutamiento por reproductor asignado ── */
-  if(ch.reproductor==='videoplayer'){
-    // Cambiar a la sección Video Player y reproducir allí
+  if(rep === 'videoplayer'){
+    // Solo Video Player: cambiar vista y reproducir allí
     showView('videoPlayer');
     setTimeout(()=>vpPlayChannel(ch), 80);
     return;
   }
+  if(rep === 'ambos'){
+    // Ambos: reproducir en el reproductor actualmente visible
+    const vpView = document.getElementById('viewVideoPlayer');
+    if(vpView && vpView.classList.contains('active')){
+      vpPlayChannel(ch);
+      return;
+    }
+    // Si no está en VP, usar reproductor nativo
+  }
+  // 'native' o default: reproductor nativo
   playChannel(ch);
 }
 
@@ -5516,9 +5528,10 @@ function vpRenderChannels() {
   const curUrl = VPState.currentUrl;
   const filtered = State.channels.filter(function(ch) {
     if (ch.estado === 'inactive' && State.role !== 'ADMIN') return false;
-    // Ocultar en VP solo si está asignado EXCLUSIVAMENTE al reproductor nativo
-    // Los admins siempre ven todos los canales para poder probarlos
-    if (ch.reproductor === 'native' && State.role !== 'ADMIN') return false;
+    const rep = ch.reproductor || 'native';
+    // VP: mostrar canales asignados a 'videoplayer' o 'ambos'
+    // Los de 'native' puro no aparecen en el VP (salvo al admin para que pueda gestionarlos)
+    if (rep === 'native' && State.role !== 'ADMIN') return false;
     if (search) {
       if (!(ch.nombre||'').toLowerCase().includes(search) &&
           !(ch.categoria||'').toLowerCase().includes(search)) return false;
